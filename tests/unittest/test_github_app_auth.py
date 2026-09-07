@@ -1,4 +1,9 @@
+import copy
+import tomllib
+from pathlib import Path
+
 import jwt
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -72,3 +77,38 @@ class TestGithubAppAuth:
             assert is_bot_user("some-bot[bot]", "Bot") is False
         finally:
             settings.set("GITHUB.IGNORE_BOT_PR", original)
+
+
+@pytest.fixture
+def bot_pr_settings():
+    """Snapshot both sections wholesale: Dynaconf's ``unset`` does not remove a dotted key,
+    so a key a test adds can only be dropped by restoring its section."""
+    settings = get_settings()
+    originals = {name: copy.deepcopy(settings.get(name)) for name in ("GITHUB", "GITHUB_APP")}
+    try:
+        yield settings
+    finally:
+        for name, original in originals.items():
+            settings.unset(name, force=True)
+            settings.set(name, original)
+
+
+class TestIgnoreBotPrSections:
+    def test_option_ships_under_the_github_section(self):
+        import pr_agent
+
+        config_path = Path(pr_agent.__file__).parent / "settings" / "configuration.toml"
+        with config_path.open("rb") as handle:
+            shipped = tomllib.load(handle)
+
+        # Read the file, not the merged settings, so env overrides cannot skew this.
+        assert "ignore_bot_pr" in shipped["github"]
+        assert "ignore_bot_pr" not in shipped.get("github_app", {})
+
+    def test_legacy_github_app_override_is_honoured(self, bot_pr_settings):
+        from pr_agent.servers.github_app import is_bot_user
+
+        bot_pr_settings.set("GITHUB.IGNORE_BOT_PR", True)
+        bot_pr_settings.set("GITHUB_APP.IGNORE_BOT_PR", False)
+
+        assert is_bot_user("dependabot[bot]", "Bot") is False
