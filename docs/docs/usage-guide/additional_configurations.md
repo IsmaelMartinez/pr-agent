@@ -9,7 +9,7 @@ To print all the available configurations as a comment on your PR, you can use t
 /config
 ```
 
-![possible_config1](https://codium.ai/images/pr_agent/possible_config1.png){width=512}
+![possible_config1](../assets/possible_config1.png){width=512}
 
 To view the **actual** configurations used for a specific tool, after all the user settings are applied, you can add for each tool a `--config.output_relevant_configurations=true` suffix.
 For example:
@@ -20,7 +20,7 @@ For example:
 
 Will output an additional field showing the actual configurations used for the `improve` tool.
 
-![possible_config2](https://codium.ai/images/pr_agent/possible_config2.png){width=512}
+![possible_config2](../assets/possible_config2.png){width=512}
 
 ### Showing the agent run details
 
@@ -42,7 +42,7 @@ On providers that support GitHub-Flavored Markdown this appends a collapsible se
 
 ```
 ⚙️ Agent run details
-- Model: gpt-5.6-terra (fallback)
+- Model: provider/fallback-model (fallback)
 - Tokens: 12,340 in / 1,205 out / 13,545 total
 - Time cost: 8.2s
 - AI calls: 1
@@ -247,6 +247,52 @@ LANGSMITH_PROJECT=<project>
 LANGSMITH_BASE_URL=<url>
 ```
 
+To use [Langfuse](https://langfuse.com) for utilization and adoption tracking (LLM cost, token usage, latency, and unique repo adoption), add the following to your configuration:
+
+```toml
+[litellm]
+enable_callbacks = true
+success_callback = ["langfuse_otel"]
+failure_callback = ["langfuse_otel"]
+```
+
+> Note: use `langfuse_otel` (the OpenTelemetry-based integration), not the legacy `langfuse` callback — the legacy callback is incompatible with the Langfuse 3.x SDK this project pins.
+
+Then set the following environment variables:
+
+```
+LANGFUSE_HOST=https://cloud.langfuse.com
+LANGFUSE_PUBLIC_KEY=<public_key>
+LANGFUSE_SECRET_KEY=<secret_key>
+```
+
+Each LLM call is traced with the command name, git provider, PR URL, model, token counts, and version as tags — giving you full visibility into how pr-agent is being used across your repositories.
+
+### LLM telemetry via LiteLLM's OpenTelemetry integration
+
+To emit OpenTelemetry traces and metrics for the LLM calls themselves — cost in USD, call duration, time to first token, and the input/output token split, on standard `gen_ai.*` semantic-convention names — enable LiteLLM's built-in `otel` callback:
+
+```toml
+[litellm]
+success_callback = ["otel"]
+failure_callback = ["otel"]
+turn_off_message_logging = true
+```
+
+> **Set `turn_off_message_logging = true`.** LiteLLM attaches full prompt and response content to what its callbacks emit, which here means the entire PR diff. The default is `false` to preserve existing behavior for Langfuse and LangSmith users.
+
+The integration is configured through environment variables:
+
+```
+OTEL_EXPORTER=otlp_http            # or "console", "otlp_grpc"
+OTEL_EXPORTER_OTLP_ENDPOINT=https://collector:4318
+OTEL_EXPORTER_OTLP_HEADERS=...
+OTEL_SERVICE_NAME=pr-agent
+LITELLM_OTEL_INTEGRATION_ENABLE_METRICS=true   # metrics are off by default
+```
+
+Pending callbacks are flushed before the CLI and the GitHub Action runner exit, bounded by `callback_timeout_seconds` (see [Custom callbacks](#custom-callbacks)).
+
 ### Custom callbacks
 
 If you embed PR-Agent in your own code, you can also register callbacks programmatically — for example a
@@ -273,6 +319,85 @@ that flush may take:
 [litellm]
 callback_timeout_seconds = 30 # default
 ```
+
+## Built-in OpenTelemetry command telemetry
+
+PR-Agent can emit its own [OpenTelemetry](https://opentelemetry.io/) signals for utilization and adoption tracking. These cover the **command** layer — how often each tool runs, on which git provider, and whether it succeeded — which no LLM-level integration can report, because many failures happen before any model call:
+
+- **Traces**: one span per request, named `pr_agent <command>` (for example `pr_agent review`), carrying `pr_agent.command`, `pr_agent.args_count`, `vcs.provider.name`, a span status, and a bounded `error.type` on failure. Prompt and response content is never attached.
+- **Metrics**: `pr_agent.commands`, a counter of executed commands labeled by command and git provider.
+
+### Two independent layers
+
+Command telemetry (this section) and [LLM telemetry](#llm-telemetry-via-litellms-opentelemetry-integration) are separate toggles with separate configuration, so you can enable either alone and aggregate them independently. When both are on, the LLM spans are children of the command span in the same trace, so a single command's model calls stay attributable to it.
+
+Telemetry is disabled by default. To enable it, set in `configuration.toml`:
+
+```toml
+[otel]
+is_enabled = true
+exporter_type = "console" # "console", "otlp", "prometheus", or "none"
+service_name = "pr-agent"
+environment = "development" # e.g. "development", "staging", "production"
+```
+
+To export to an OpenTelemetry collector instead of the console, set `exporter_type = "otlp"` and configure the endpoint and any authentication headers in `.secrets.toml` (they are secrets — keep them out of `configuration.toml`):
+
+```toml
+[otel]
+otlp_endpoint = "http://my-collector:4318"
+otlp_headers = "x-honeycomb-team=YOUR_API_KEY" # optional, "key1=value1,key2=value2"
+```
+
+Export uses OTLP over HTTP by default; `otlp_endpoint` is the base URL, and the `/v1/traces` and `/v1/metrics` paths are appended automatically. To use OTLP over gRPC instead, install the optional exporter and select the protocol — the endpoint is then used as-is (gRPC collectors typically listen on port 4317):
+
+```bash
+pip install pr-agent[otel-grpc]
+```
+
+```toml
+[otel]
+otlp_protocol = "grpc" # default: "http"
+```
+
+This is the recommended topology for fleets: point every PR-Agent instance at the same collector and aggregate there. Each process creates its own exporter connection; use the `service_name` and `environment` resource attributes to slice instances apart on the backend.
+
+### Exposing native Prometheus metrics
+
+Instead of pushing to a collector, set `exporter_type = "prometheus"` to expose a native `GET /metrics` scrape endpoint on the gunicorn-served apps (`github_app`, `gitlab_webhook`, `azuredevops_server_webhook`, `gitea_app`). The command counter is translated into the Prometheus text format, and every gunicorn worker's values are merged at scrape time, so counters stay correct across the process workers:
+
+```toml
+[otel]
+exporter_type = "prometheus"
+prometheus_multiproc_dir = "/tmp/pr-agent-prometheus" # shared, writable by every worker
+```
+
+1. The exporter is metrics-only: command spans are not exported in this mode.
+2. `/metrics` is mounted only when this exporter is selected, so nothing is exposed by default. It does not depend on an OTLP collector or endpoint.
+3. gunicorn registers and deregisters workers' state files automatically (`when_ready`/`child_exit`); a worker that dies mid-scrape leaves only a stale file, which is ignored once it is marked dead.
+4. Metric families are created from the first data point's label set. Later attributes that do not fit the family are dropped, and missing ones are back-filled with an empty string, so a scrape never breaks on drifting label cardinality.
+5. The exporter ships with PR-Agent (it depends on `prometheus-client`); no extra package is required. Scrape it like any exporter:
+
+```yaml
+scrape_configs:
+  - job_name: pr-agent
+    static_configs:
+      - targets: ["pr-agent:3000"]
+```
+
+Privacy controls (both off by default):
+
+- `include_pr_url = true` attaches PR URLs to spans. Off by default because URLs expose private repo names.
+- `include_error_details = true` attaches exception messages and rejected-command text to error spans. Off by default because that content can embed PR URLs, repo names, or other request-specific text. Bounded values (the exception class name and error category) are always attached.
+
+Notes:
+
+- Telemetry configuration is **process-level**: it is read once at startup from the global configuration or environment, and cannot be enabled or reconfigured per-repo via `.pr_agent.toml`. In a multi-tenant server, telemetry is a shared process resource — configure it where the process is deployed.
+- PR-Agent keeps its own OpenTelemetry providers and never registers the process-global one, so embedding PR-Agent in an application that already uses OpenTelemetry will not interfere with the host's telemetry. Pending spans and metrics are flushed automatically on process exit.
+- Each OTLP export call is bounded by `otlp_timeout` (default 3 seconds, retries included), so an unreachable collector cannot hang CLI exit or request completion. Raise it for slow collectors at the cost of longer worst-case stalls.
+- If `exporter_type = "otlp"` is set but no endpoint is configured, telemetry is disabled entirely (fail closed) — it never falls back to another exporter, so a missing secret cannot redirect telemetry into process logs.
+- With `exporter_type = "prometheus"`, `prometheus_multiproc_dir` must be a shared directory writable by every worker; it defaults to `/tmp/pr-agent-prometheus`. In non-gunicorn (single-process) deployments the exporter works without it and simply serves the process's own registry.
+- **Serverless deployments** (e.g. the AWS Lambda webhooks) are supported: buffered spans and metrics are force-flushed at the end of every handled request, because frozen execution environments stop background export threads and are reaped without running exit handlers. No extra configuration is needed.
 
 ## Bringing per-repo context files to PR-Agent
 
@@ -415,19 +540,6 @@ ignore_language_framework = ['protobuf', ...]
 
 You can view the list of auto-generated file patterns in [`generated_code_ignore.toml`](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/generated_code_ignore.toml).
 Files matching these glob patterns will be automatically excluded from PR Agent analysis.
-
-### Ignoring Tickets with Specific Labels
-
-When PR-Agent analyzes tickets (JIRA, GitHub Issues, GitLab Issues, etc.) referenced in your PR, you may want to exclude tickets that have certain labels from the analysis. This is useful for filtering out tickets marked as "ignore-compliance", "skip-review", or other labels that indicate the ticket should not be considered during PR review.
-
-To ignore tickets with specific labels, add the following to your `configuration.toml` file:
-
-```toml
-[config]
-ignore_ticket_labels = ["ignore-compliance", "skip-review", "wont-fix"]
-```
-
-Where `ignore_ticket_labels` is a list of label names that should be ignored during ticket analysis.
 
 ### Restricted Mode
 
