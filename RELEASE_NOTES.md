@@ -109,7 +109,7 @@ Significant documentation updates (see [Installation Guide](https://github.com/C
 
 #### Fixed
 
-- Gitlab: Fixed a bug of improper usage of pr_id
+- GitLab: Fixed a bug of improper usage of pr_id
 
 ### [Version 0.7] - 2023-09-20
 
@@ -186,5 +186,5 @@ Significant documentation updates (see [Installation Guide](https://github.com/C
 #### Added
 
 - New feature for updating the CHANGELOG.md based on the contents of a PR.
-- Added support for this feature for the Github provider.
+- Added support for this feature for the GitHub provider.
 - New configuration settings and prompts for the changelog update feature.

@@ -2,7 +2,7 @@ To run PR-Agent locally, you first need to acquire two keys:
 
 Local execution has two distinct cases: use the hosted-provider examples below for an existing PR/MR URL, or use the [Local Git Provider guide](../usage-guide/local_git_provider.md) for branch comparisons without a hosted PR/MR.
 
-1. An OpenAI key from [here](https://platform.openai.com/api-keys){:target="_blank"}, with access to GPT-5.6 and gpt-5.6-terra (or a key for other [language models](../usage-guide/changing_a_model.md), if you prefer).
+1. An API key for your configured [language model provider](../usage-guide/changing_a_model.md). For OpenAI, create one [here](https://platform.openai.com/api-keys){:target="_blank"}.
 2. A personal access token from your Git platform (GitHub, GitLab, BitBucket, Gitea) with repo scope. GitHub token, for example, can be issued from [here](https://github.com/settings/tokens){:target="_blank"}
 
 ## Using Docker image
@@ -122,12 +122,14 @@ def main():
     get_settings().set("github.user_token", user_token)
 
     # Run the command. Feedback will appear in GitHub PR comments
-    cli.run_command(pr_url, command)
+    return cli.run_command(pr_url, command)
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
 ```
+
+With `config.propagate_tool_errors` enabled, forwarding the return value through `SystemExit` makes this script exit with status 1 after a propagated tool error. The default remains status 0.
 
 ## Run from source
 

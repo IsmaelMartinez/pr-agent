@@ -8,7 +8,7 @@ To compare two versions directly, use the compare view — for example
 Releases before `v0.12`, and the date-based log kept here during July–August 2023, are archived in
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md).
 
-## [0.43.0](https://github.com/The-PR-Agent/pr-agent/releases/tag/v0.43.0) (2026-08-22)
+## [0.45.0](https://github.com/The-PR-Agent/pr-agent/releases/tag/v0.45.0) (2026-09-05)
 
 The last release cut before this file was generated. See the
-[release notes](https://github.com/The-PR-Agent/pr-agent/releases/tag/v0.43.0).
+[release notes](https://github.com/The-PR-Agent/pr-agent/releases/tag/v0.45.0).
