@@ -15,6 +15,135 @@ from pr_agent.git_providers.azuredevops_provider import (
 from pr_agent.log import get_logger
 
 
+def test_publish_description_propagates_update_failure():
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.workspace_slug = "my-project"
+    provider.repo_slug = "my-repo"
+    provider.pr_num = 1
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.update_pull_request.side_effect = RuntimeError("permission denied")
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        provider.publish_description("AI title", "Updated description")
+
+
+def test_azure_supports_thread_resolution():
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+
+    assert provider.supports_thread_resolution() is True
+
+
+def test_azure_resolve_comment_thread_closes_thread():
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.set_thread_status = MagicMock(return_value=True)
+
+    assert provider.resolve_comment_thread(42) is True
+    provider.set_thread_status.assert_called_once_with(42, "closed")
+
+
+def _language_provider(items):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.workspace_slug = "proj"
+    provider.repo_slug = "repo"
+    provider.pr = SimpleNamespace(
+        last_merge_target_commit=SimpleNamespace(commit_id="base-sha"),
+        last_merge_commit=SimpleNamespace(commit_id="head-sha"),
+    )
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_items.return_value = items
+    return provider
+
+
+def test_get_languages_returns_language_names():
+    # get_languages() must key on language NAMES (e.g. "Python"), not raw
+    # extensions ("py"): sort_files_by_main_languages() maps names back to
+    # extensions, so extension keys would drop every file into "Other".
+    provider = _language_provider([
+        SimpleNamespace(git_object_type="blob", path="a.py"),
+        SimpleNamespace(git_object_type="blob", path="b.py"),
+        SimpleNamespace(git_object_type="blob", path="c.py"),
+        SimpleNamespace(git_object_type="blob", path="d.js"),
+        SimpleNamespace(git_object_type="blob", path="weird.zzz"),
+    ])
+
+    languages = provider.get_languages()
+
+    # 3 Python + 1 JavaScript known; .zzz is unknown and excluded from the total.
+    assert languages == {"Python": 75.0, "JavaScript": 25.0}
+
+
+def test_get_languages_queries_target_commit_inventory():
+    provider = _language_provider(
+        [SimpleNamespace(git_object_type="blob", path="a.py")]
+    )
+
+    provider.get_languages()
+
+    call_kwargs = provider.azure_devops_client.get_items.call_args.kwargs
+    assert call_kwargs["version_descriptor"].version == "base-sha"
+    assert call_kwargs["version_descriptor"].version_type == "commit"
+
+
+def test_get_languages_returns_empty_map_when_target_commit_missing():
+    provider = _language_provider(
+        [SimpleNamespace(git_object_type="blob", path="a.py")]
+    )
+    provider.pr = SimpleNamespace(last_merge_target_commit=None)
+
+    assert provider.get_languages() == {}
+    provider.azure_devops_client.get_items.assert_not_called()
+
+
+def test_get_languages_returns_empty_map_when_target_commit_id_missing():
+    provider = _language_provider(
+        [SimpleNamespace(git_object_type="blob", path="a.py")]
+    )
+    provider.pr = SimpleNamespace(last_merge_target_commit=SimpleNamespace(commit_id=None))
+
+    assert provider.get_languages() == {}
+    provider.azure_devops_client.get_items.assert_not_called()
+
+
+def test_get_languages_returns_empty_map_when_nothing_matches():
+    provider = _language_provider([
+        SimpleNamespace(git_object_type="blob", path="weird.zzz"),
+        SimpleNamespace(git_object_type="blob", path=""),
+    ])
+
+    assert provider.get_languages() == {}
+
+
+def test_get_languages_maps_full_paths_and_multipart_extensions():
+    # The matcher must classify by the basename and honor multipart extensions.
+    provider = _language_provider([
+        SimpleNamespace(git_object_type="blob", path="src/foo.py"),
+        SimpleNamespace(git_object_type="blob", path="lib/bar.py"),
+        SimpleNamespace(git_object_type="blob", path="doc/README.md"),
+        SimpleNamespace(git_object_type="blob", path="notes.txt"),
+        SimpleNamespace(git_object_type="blob", path="tpl/file.test.ts"),
+    ])
+
+    languages = provider.get_languages()
+
+    assert languages == {"Python": 40.0, "Markdown": 20.0, "Text": 20.0, "TypeScript": 20.0}
+
+
+def test_get_languages_ignores_non_blob_items_and_other_languages():
+    # Percentages come from the repository blob inventory, not the PR change set:
+    # non-blob entries (e.g. folders) must be skipped, and off-language files
+    # must not skew the ranking.
+    provider = _language_provider([
+        SimpleNamespace(git_object_type="Folder", path="src"),
+        SimpleNamespace(git_object_type="blob", path="src/app.py"),
+        SimpleNamespace(git_object_type="blob", path="src/main.py"),
+        SimpleNamespace(git_object_type="blob", path="render.bin"),
+    ])
+
+    languages = provider.get_languages()
+
+    assert languages == {"Python": 100.0}
+
+
 class TestAzureDevopsProviderRepoContext:
     def test_get_repo_file_content_reads_from_target_commit(self):
         # Repo-context files must be read from the PR target (base) commit, matching
@@ -1658,3 +1787,105 @@ class TestAzureDevopsProviderSuggestionFence:
         provider.publish_code_suggestions([suggestion])
 
         assert "```suggestion" in _created_threads(provider)[-1].comments[0].content
+
+
+class TestAzureDevopsGlobalSettings:
+    @pytest.fixture(autouse=True)
+    def _clear_global_settings_cache(self):
+        # The org global-settings cache is process-level; clear it between tests.
+        from pr_agent.git_providers import git_provider as _gp
+        _gp._GLOBAL_SETTINGS_CACHE.clear()
+        yield
+        _gp._GLOBAL_SETTINGS_CACHE.clear()
+
+    def _make_provider(self):
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.workspace_slug = "my-project"
+        provider.repo_slug = "my-repo"
+        provider.azure_devops_client = MagicMock()
+        return provider
+
+    @staticmethod
+    def _set_org_settings(ms, org):
+        ms.return_value.config.use_global_settings_file = True
+        ms.return_value.azure_devops.get.return_value = org
+
+    def test_get_owning_namespace_returns_configured_org(self):
+        provider = self._make_provider()
+        with patch("pr_agent.git_providers.azuredevops_provider.get_settings") as ms:
+            self._set_org_settings(ms, "myorg")
+            assert provider.get_owning_namespace() == "myorg"
+
+    def test_get_owning_namespace_parses_org_from_collection_url(self):
+        provider = self._make_provider()
+        with patch("pr_agent.git_providers.azuredevops_provider.get_settings") as ms:
+            self._set_org_settings(ms, "https://dev.azure.com/myorg")
+            assert provider.get_owning_namespace() == "myorg"
+
+    def test_get_owning_namespace_none_when_org_unset(self):
+        provider = self._make_provider()
+        with patch("pr_agent.git_providers.azuredevops_provider.get_settings") as ms:
+            self._set_org_settings(ms, None)
+            assert provider.get_owning_namespace() is None
+
+    def test_fetch_global_repo_settings_reads_pr_agent_settings_from_pr_project(self):
+        provider = self._make_provider()
+        provider.azure_devops_client.get_item_content.return_value = [b"[pr_reviewer]"]
+        result = provider._fetch_global_repo_settings("myorg")
+
+        assert result == b"[pr_reviewer]"
+        provider.azure_devops_client.get_item_content.assert_called_once_with(
+            repository_id="pr-agent-settings",
+            project="my-project",
+            download=False,
+            include_content_metadata=False,
+            include_content=True,
+            path=".pr_agent.toml",
+        )
+
+    def test_fetch_global_repo_settings_404_returns_empty_and_propagates_other_errors(self):
+        provider = self._make_provider()
+        provider.azure_devops_client.get_item_content.side_effect = Exception(
+            "Operation returned a 404 status code."
+        )
+        assert provider._fetch_global_repo_settings("myorg") == ""
+
+    def test_get_repo_settings_merges_global_then_local(self):
+        provider = self._make_provider()
+        provider.azure_devops_client.get_item_content.side_effect = [
+            [b"[pr_reviewer]\nextra_instructions = \"global\"\n"],
+            [b"[pr_reviewer]\nextra_instructions = \"local\"\n"],
+        ]
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.azuredevops_provider.get_settings") as az:
+            az.return_value.azure_devops.get.return_value = "myorg"
+            ms.return_value.config.use_global_settings_file = True
+            result = provider.get_repo_settings()
+
+        assert result == [
+            ("global", b"[pr_reviewer]\nextra_instructions = \"global\"\n"),
+            ("local", b"[pr_reviewer]\nextra_instructions = \"local\"\n"),
+        ]
+
+    def test_get_repo_settings_only_local_when_global_disabled(self):
+        provider = self._make_provider()
+        provider.azure_devops_client.get_item_content.side_effect = [
+            [b"[pr_reviewer]\ntemperature = 0.2\n"],
+        ]
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+            ms.return_value.config.use_global_settings_file = False
+            result = provider.get_repo_settings()
+
+        assert result == [("local", b"[pr_reviewer]\ntemperature = 0.2\n")]
+
+    def test_global_settings_result_is_cached(self):
+        provider = self._make_provider()
+        provider.azure_devops_client.get_item_content.return_value = [b"[pr_reviewer]\nnum_max_findings = 5\n"]
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.azuredevops_provider.get_settings") as az:
+            az.return_value.azure_devops.get.return_value = "myorg"
+            ms.return_value.config.use_global_settings_file = True
+            assert provider._get_global_repo_settings() == b"[pr_reviewer]\nnum_max_findings = 5\n"
+            assert provider._get_global_repo_settings() == b"[pr_reviewer]\nnum_max_findings = 5\n"  # cached
+
+        assert provider.azure_devops_client.get_item_content.call_count == 1
