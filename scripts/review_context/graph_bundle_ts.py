@@ -18,16 +18,25 @@ Usage: graph_bundle_ts.py --repo ROOT --base BASE_SHA --head HEAD_SHA --pr N --o
 import argparse
 import bisect
 import difflib
+import fnmatch
 import heapq
 import json
 import os
+import posixpath
 import re
+import signal
 import subprocess
 import sys
 
 from tree_sitter import Query, QueryCursor
-from tree_sitter_language_pack import (PackConfig, configure, detect_language_from_extension, get_language,
-                                        get_parser, get_tags_query)
+from tree_sitter_language_pack import (
+    PackConfig,
+    configure,
+    detect_language_from_extension,
+    get_language,
+    get_parser,
+    get_tags_query,
+)
 
 sys.setrecursionlimit(20000)
 
@@ -73,8 +82,83 @@ DOTTED = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$")
 PUNCT = set("()[]{},;:.")
 
 
+# Untrusted input: the head commit's tree is read as git blobs only, never from a working tree, so a symlink,
+# submodule or untracked file cannot reach the bundle; oversized and secret-looking files are left out too.
+MAX_FILE_BYTES = 1_000_000
+DEFAULT_TIMEOUT_S = 120
+SECRET_NAMES = (".env", ".env.*", "*.env", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".secrets.toml",
+                "secrets.toml", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore", "id_rsa*", "id_dsa*",
+                "id_ecdsa*", "id_ed25519*", "*.tfstate", "*.tfstate.*", "credentials", "credentials.*")
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1"}
+
+
+def git_cmd(repo, *args):
+    # No fsmonitor or hook programs, and no protocol, so a partial clone cannot fetch from the network.
+    return ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
+            "-C", repo, *args]
+
+
 def git(repo, *args):
-    return subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True, text=True).stdout
+    return subprocess.run(git_cmd(repo, *args), check=True, capture_output=True, text=True, env=GIT_ENV).stdout
+
+
+def is_secret_path(path):
+    name = posixpath.basename(path).lower()
+    return any(fnmatch.fnmatchcase(name, pat) for pat in SECRET_NAMES)
+
+
+class HeadTree:
+    """Regular files tracked at the head commit, read through one `git cat-file --batch` process."""
+
+    def __init__(self, repo, head):
+        self.repo, self.blobs, self.dirs, self._cat = repo, {}, {}, None
+        out = subprocess.run(git_cmd(repo, "ls-tree", "-r", "-l", "-z", "--full-tree", head), check=True,
+                             capture_output=True, env=GIT_ENV).stdout
+        for entry in out.split(b"\0"):
+            if not entry:
+                continue
+            meta, raw = entry.split(b"\t", 1)
+            mode, kind, sha, size = meta.split()
+            path = raw.decode("utf-8", "surrogateescape")
+            if (kind == b"blob" and mode in (b"100644", b"100755") and int(size) <= MAX_FILE_BYTES
+                    and not is_secret_path(path)):
+                self.blobs[path] = sha.decode()
+                self.dirs.setdefault(posixpath.dirname(path), []).append(posixpath.basename(path))
+
+    def is_file(self, path):
+        return path in self.blobs
+
+    def listdir(self, folder):
+        return list(self.dirs.get(folder, []))
+
+    def read_text(self, path):
+        sha = self.blobs.get(path)
+        if sha is None:
+            return None
+        if self._cat is None:
+            self._cat = subprocess.Popen(git_cmd(self.repo, "cat-file", "--batch"), stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, env=GIT_ENV)
+        self._cat.stdin.write(sha.encode() + b"\n")
+        self._cat.stdin.flush()
+        header = self._cat.stdout.readline().split()
+        if len(header) != 3:
+            return None
+        data = self._cat.stdout.read(int(header[2]))
+        self._cat.stdout.read(1)
+        try:
+            # Same newline handling as open() in text mode, so line numbers match the diff.
+            return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        except UnicodeDecodeError:
+            return None
+
+    def close(self):
+        if self._cat is not None:
+            self._cat.stdin.close()
+            self._cat.wait()
+            self._cat = None
+
+
+HEAD = None  # the HeadTree of the commit being reviewed, set by build()
 
 
 TEST_FILE = re.compile(r"(^test_.*|.*(_test|\.test|\.spec|_spec)\.\w+)$")
@@ -371,8 +455,8 @@ class Python(Lang):
 
     def module_bindings(self, root):
         consts, names = {}, set()
-        stmts = list(root.named_children) + [s for n in root.named_children if n.type in ("if_statement", "try_statement")
-                                             for s in self._blocks(n)]
+        stmts = list(root.named_children) + [s for n in root.named_children
+                                             if n.type in ("if_statement", "try_statement") for s in self._blocks(n)]
         for n in stmts:
             inner = self.owner_node(n)
             if inner.type in ("function_definition", "class_definition"):
@@ -397,7 +481,7 @@ class Python(Lang):
 
     def module_of(self, rel):
         mod = rel[:-3].replace("/", ".")
-        return mod[:-9] if mod.endswith(".__init__") else mod
+        return mod.removesuffix(".__init__")
 
     def _from_module(self, rel, n):
         pkg = rel.rsplit("/", 1)[0].replace("/", ".") if "/" in rel else ""
@@ -417,7 +501,7 @@ class Python(Lang):
     def _module_file(self, repo, dotted):
         base = dotted.replace(".", "/")
         for cand in (base + ".py", base + "/__init__.py"):
-            if cand in repo.trees or os.path.isfile(os.path.join(repo.root, cand)):
+            if cand in repo.trees or HEAD.is_file(cand):
                 return cand
         return None
 
@@ -795,7 +879,7 @@ class JavaScript(Lang):
         base = os.path.normpath(os.path.join(here, spec)).replace(os.sep, "/")
         for cand in [base] + [base + s for s in self.suffixes] + [f"{base}/index{s}" for s in self.suffixes]:
             if cand in repo.trees or (os.path.splitext(cand)[1] in self.suffixes
-                                      and os.path.isfile(os.path.join(repo.root, cand))):
+                                      and HEAD.is_file(cand)):
                 return cand
         return None
 
@@ -899,7 +983,7 @@ class JavaScript(Lang):
                 left = n.field_child("left")
                 if left is not None and left.type == "identifier":
                     out.add(left.text)
-            elif n.type in ("for_in_statement",):
+            elif n.type == "for_in_statement":
                 left = n.field_child("left")
                 for x in walk(left) if left is not None else []:
                     if x.type == "identifier":
@@ -1430,11 +1514,12 @@ HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 def parse_diff(repo, base, head):
     mb = git(repo, "merge-base", base, head).strip()
     files = {}
-    for line in git(repo, "diff", "--name-status", "-M", mb, head).splitlines():
+    for line in git(repo, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "-M", mb, head).splitlines():
         parts = line.split("\t")
         files[parts[-1]] = {"added": set(), "del_anchors": set(), "status": parts[0][0]}
     cur = None
-    for line in git(repo, "diff", "--unified=0", "-M", "--no-color", mb, head).splitlines():
+    for line in git(repo, "diff", "--no-ext-diff", "--no-textconv", "--unified=0", "-M", "--no-color", mb,
+                    head).splitlines():
         if line.startswith("+++ "):
             p = line[4:]
             cur = p[2:] if p.startswith("b/") else None
@@ -1527,12 +1612,10 @@ class Repo:
         self.consts, self.modnames, self._modfile, self.langs = {}, {}, {}, {}
         self._edges = {}
         suffixes = tuple(s for lg in langs for s in lg.suffixes)
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
-            for fn in filenames:
-                if fn.endswith(suffixes):
-                    rel = os.path.relpath(os.path.join(dirpath, fn), root).replace(os.sep, "/")
-                    self.trees[rel] = None
+        for rel in HEAD.blobs:
+            dirs = rel.split("/")[:-1]
+            if rel.endswith(suffixes) and not any(d in SKIP_DIRS or d.startswith(".") for d in dirs):
+                self.trees[rel] = None
         for rel in sorted(self.trees):
             self.load(rel)
         for rel in sorted(self.sources):
@@ -1543,19 +1626,22 @@ class Repo:
 
     def load(self, rel):
         lang = lang_for(rel)
-        try:
-            with open(os.path.join(self.root, rel), encoding="utf-8") as fh:
-                src = fh.read()
-        except (UnicodeDecodeError, OSError):
+        src = HEAD.read_text(rel)
+        if src is None:
             return
-        root, broken = lang.parse(src)
-        if broken:
-            return  # unparsable at head (the stdlib builder skipped what ast.parse refused)
+        try:
+            root, broken = lang.parse(src)
+            if broken:
+                return  # unparsable at head (the stdlib builder skipped what ast.parse refused)
+            defs = collect_defs(rel, root, lang)
+            bindings = lang.module_bindings(root)
+        except RecursionError:
+            return  # nested too deeply to walk; leave the file out rather than fail the build
         self.sources[rel] = src.splitlines()
         self.trees[rel] = root
         self.langs[rel] = lang
-        self.defs.extend(collect_defs(rel, root, lang))
-        self.consts[rel], self.modnames[rel] = lang.module_bindings(root)
+        self.defs.extend(defs)
+        self.consts[rel], self.modnames[rel] = bindings
 
     def resolve_const(self, path, name, depth=0):
         if name in self.consts.get(path, {}):
@@ -2093,7 +2179,8 @@ HUNK_FULL = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 
 def parse_deletions(repo, mb, head):
     out, old, new, in_header = {}, None, None, False
-    for line in git(repo, "diff", "--unified=0", "-M", "--no-color", mb, head).splitlines():
+    for line in git(repo, "diff", "--no-ext-diff", "--no-textconv", "--unified=0", "-M", "--no-color", mb,
+                    head).splitlines():
         if line.startswith("diff --git "):
             in_header, old, new = True, None, None
             continue
@@ -2298,7 +2385,7 @@ def find_siblings(repo, d, changed_keys):
             k = m.parent
             theirs = base_names(k)
             if mine & theirs:
-                rel = f"shares base `{sorted(mine & theirs)[0]}`"
+                rel = f"shares base `{min(mine & theirs)}`"
             elif k.name in mine:
                 rel = "base class"
             elif cls.name in theirs:
@@ -2394,11 +2481,8 @@ def file_sections(lines, suffix):
 
 
 def read_lines(root, rel):
-    try:
-        with open(os.path.join(root, rel), encoding="utf-8") as fh:
-            return fh.read().splitlines()
-    except (OSError, UnicodeDecodeError):
-        return None
+    text = HEAD.read_text(rel)
+    return None if text is None else text.splitlines()
 
 
 def noncode_siblings(root, path, info, base):
@@ -2423,11 +2507,7 @@ def noncode_siblings(root, path, info, base):
         freq[t.strip()] = freq.get(t.strip(), 0) + 1
     probes += [(t, "context") for t in ctx if len(t) >= 12 and freq.get(t) == 1 and t not in both][:NONCODE_PROBES // 2]
     folder = os.path.dirname(path)
-    try:
-        names = sorted(f for f in os.listdir(os.path.join(root, folder) if folder else root)
-                       if os.path.splitext(f)[1] in group)
-    except OSError:
-        return []
+    names = sorted(f for f in HEAD.listdir(folder) if os.path.splitext(f)[1] in group)
     stem = os.path.splitext(os.path.basename(path))[0]
     ranked = sorted(((difflib.SequenceMatcher(None, stem, os.path.splitext(f)[0]).ratio(), f) for f in names
                      if f != os.path.basename(path)), key=lambda x: (-x[0], x[1]))[:40]
@@ -2518,6 +2598,15 @@ def default_scope(code_changed):
 
 
 def build(args):
+    global HEAD
+    HEAD = HeadTree(args.repo, args.head)
+    try:
+        return _build(args)
+    finally:
+        HEAD.close()
+
+
+def _build(args):
     mb, files = parse_diff(args.repo, args.base, args.head)
     changed_langs = [lg for lg in LANGS if any(p.endswith(lg.suffixes) for p in files)] or LANGS[:1]
     repo = Repo(args.repo, changed_langs)
@@ -2912,8 +3001,10 @@ def build(args):
     text, summary, counts, sizes = assemble(header, nonpy, sections, hub_lines, cycles_text, scope_desc)
     os.makedirs(args.out_dir, exist_ok=True)
     name = args.name or str(args.pr)
-    with open(os.path.join(args.out_dir, f"pr{name}.G6.md"), "w", encoding="utf-8") as fh:
+    out_path = os.path.join(args.out_dir, f"pr{name}.G6.md")
+    with open(out_path + ".tmp", "w", encoding="utf-8") as fh:
         fh.write(text)
+    os.replace(out_path + ".tmp", out_path)  # a crash or timeout never leaves a partial bundle behind
     found = {k: sum(1 for s in sections if s["kind"] == k) for k in KINDS}
     manifest = dict(
         pr=args.pr, name=name, base=args.base, head=args.head, merge_base=mb, scope=scope,
@@ -3090,8 +3181,20 @@ if __name__ == "__main__":
                     help="Graphify output dir (holding graph.json): take callers and callees from its call edges")
     ap.add_argument("--generic", action="store_true",
                     help="use the generic tags-query class for every language, Python and JavaScript included")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S,
+                    help="wall-clock limit for the build in seconds, after the grammars are loaded")
     a = ap.parse_args()
     if a.grammar_cache:
         configure(PackConfig(cache_dir=a.grammar_cache))
     LANGS[:] = tags_langs([]) if a.generic else LANGS + tags_langs(LANGS)
-    build(a)
+
+    def _timeout(_signum, _frame):
+        raise TimeoutError(f"build exceeded {a.timeout} s")
+
+    signal.signal(signal.SIGALRM, _timeout)
+    signal.alarm(a.timeout)
+    try:
+        build(a)
+    except Exception as e:  # one line and exit 2, no bundle: the caller runs a diff-only review instead
+        print(f"review-context build failed: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr)
+        sys.exit(2)
