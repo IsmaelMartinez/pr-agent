@@ -11,7 +11,7 @@ def page_count(total_items: int, page_size: int) -> int:
 
 def page_slice(items: list, page: int, page_size: int) -> list:
     """The items on a 1-based page."""
-    start = page * page_size
+    start = (page - 1) * page_size
     return items[start:start + page_size]
 
 
