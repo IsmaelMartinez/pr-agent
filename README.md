@@ -1,4 +1,4 @@
-
+<!-- live test of gated auto-approval, fork only -->
 
 <br />
 
