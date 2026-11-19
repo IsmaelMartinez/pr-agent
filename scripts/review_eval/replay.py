@@ -16,9 +16,10 @@ import traceback
 
 RUN = pathlib.Path(os.environ["REVIEW_EVAL_RUN_DIR"])
 CASE = json.loads(pathlib.Path(os.environ["REVIEW_EVAL_CASE"]).read_text())
+COMMAND = os.environ.get("REVIEW_EVAL_COMMAND", "review")
 os.environ.update({
     "CONFIG__GIT_PROVIDER": "local",
-    "CONFIG__PUBLISH_OUTPUT": "true",
+    "CONFIG__PUBLISH_OUTPUT": "true" if COMMAND == "review" else "false",
     "CONFIG__USE_REPO_SETTINGS_FILE": "false",
     "LOCAL__REVIEW_PATH": str(RUN / "final.md"),
 })
@@ -26,8 +27,13 @@ os.environ.update({
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler  # noqa: E402
 from pr_agent.algo.review_json_output import review_json_output_path  # noqa: E402
 from pr_agent.algo.run_details import command_failed, init_run_details  # noqa: E402
-from pr_agent.commands import ticket_pr_compliance_check  # noqa: E402
-from pr_agent.commands.pr_reviewer import PRReviewer  # noqa: E402
+
+try:  # tools were renamed to commands after v0.50.0
+    from pr_agent.commands import ticket_pr_compliance_check  # noqa: E402
+    from pr_agent.commands.pr_reviewer import PRReviewer  # noqa: E402
+except ImportError:
+    from pr_agent.tools import ticket_pr_compliance_check  # noqa: E402
+    from pr_agent.tools.pr_reviewer import PRReviewer  # noqa: E402
 from pr_agent.git_providers.local_git_provider import LocalGitProvider  # noqa: E402
 
 usage, finish = [], []
@@ -79,6 +85,18 @@ async def main():
     init_run_details()  # PRReviewer swallows model errors and records them here, as the CLI expects
     review_json_output_path.set(str(RUN / "review.json"))  # the parsed findings, with file and lines
     try:
+        if COMMAND == "improve":
+            from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
+            tool = PRCodeSuggestions(os.environ["REVIEW_EVAL_TARGET_BRANCH"])
+            await tool.run()
+            if command_failed():
+                return "the review recorded a failure (see stderr.log)"
+            data = getattr(tool, "data", None) or {"code_suggestions": []}
+            # publish_output is off, so apply the anchoring filter the summary comment would apply before posting
+            data["code_suggestions"] = [s for s in data.get("code_suggestions") or []
+                                        if tool._is_suggestion_line_range_valid(s)]
+            (RUN / "improve.json").write_text(json.dumps(data, default=str))
+            return None
         await PRReviewer(os.environ["REVIEW_EVAL_TARGET_BRANCH"]).run()
         return "the review recorded a failure (see stderr.log)" if command_failed() else None
     except Exception:  # noqa: BLE001  recorded in status.json so the run counts as failed
@@ -89,11 +107,13 @@ async def main():
         return text
 
 
-for stale in ("final.md", "review.json"):
+for stale in ("final.md", "review.json", "improve.json"):
     (RUN / stale).unlink(missing_ok=True)
 error = asyncio.run(main())
 final = RUN / "final.md"
+produced = (RUN / "improve.json").exists() if COMMAND == "improve" else \
+    final.exists() and final.stat().st_size > 0 and (RUN / "review.json").exists()
 (RUN / "status.json").write_text(json.dumps({
-    "ok": error is None and final.exists() and final.stat().st_size > 0 and (RUN / "review.json").exists(),
+    "ok": error is None and produced,
     "error": error, "usage": usage, "finish": finish}))
 sys.exit(0)

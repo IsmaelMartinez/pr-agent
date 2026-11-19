@@ -29,7 +29,9 @@ REPLAY = HERE / "replay.py"
 BRANCH_PREFIX = "review-eval-base-"
 MAX_DIFF = 60_000
 PASS_ENV = ("PATH", "HOME", "TMPDIR", "SSL_CERT_FILE")
-SECRET_ENV = {"openai": ("OPENAI__KEY", "OPENAI_KEY")}
+SECRET_ENV = {"openai": ("OPENAI__KEY", "OPENAI_KEY"), "anthropic": ("ANTHROPIC__KEY",)}
+# spike: which pr-agent tree, interpreter and command to replay; combine judges other outs' findings together
+OPT = {"code": REPO, "python": sys.executable, "command": "review", "threshold": 1, "combine": []}
 OVERRIDE_SECTIONS = {"CONFIG", "PR_REVIEWER"}
 OVERRIDE_DENY = {"KEY", "KEYS", "TOKEN", "SECRET", "PASSWORD", "BASE", "URL", "PROXY", "HEADER", "HEADERS", "TYPE",
                  "ENDPOINT", "MODEL", "MODELS", "CERT", "SSL", "BUNDLE", "HOST"}
@@ -64,11 +66,15 @@ def fingerprints(model, judge_model, overrides, cases_file):
     """(review inputs, judge inputs) hashes: cached reviews are only valid for the same model, settings, cases,
     pr-agent code (committed tree plus uncommitted edits such as an overlay), lockfile and replay script; cached
     verdicts also for the same judge model and the code that builds and scores judge inputs."""
-    code = git("rev-parse", "HEAD:pr_agent").strip() + git("diff", "HEAD", "--", "pr_agent")
-    review_fp = digest(model, json.dumps(overrides, sort_keys=True), cases_file.read_text(), code,
-                       (REPO / "uv.lock").read_text(), REPLAY.read_text())
+    if OPT["combine"]:
+        review_fp = digest("combine", *[(pathlib.Path(o) / "inputs.json").read_text() for o in OPT["combine"]])
+    else:
+        code = git("rev-parse", "HEAD:pr_agent", cwd=OPT["code"]).strip() + \
+            git("diff", "HEAD", "--", "pr_agent", cwd=OPT["code"])
+        review_fp = digest(model, json.dumps(overrides, sort_keys=True), cases_file.read_text(), code,
+                           (OPT["code"] / "uv.lock").read_text(), REPLAY.read_text(), OPT["command"])
     judge_code = "".join((HERE / f).read_text() for f in ("judge.py", "score.py", "run_eval.py"))
-    return review_fp, digest(review_fp, judge_model, judge_code)
+    return review_fp, digest(review_fp, judge_model, judge_code, str(OPT["threshold"]))
 
 
 def check_cache(out, review_fp, judge_fp):
@@ -110,8 +116,8 @@ def parse_overrides(items):
 def child_env(model, overrides):
     """Allowlist: a few process vars, the model settings, SECTION__KEY overrides, and the model provider's key."""
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
-    env.update({"PYTHONPATH": str(REPO), "CONFIG__MODEL": model, "CONFIG__MODEL_WEAK": model,
-                "CONFIG__MODEL_REASONING": model, "CONFIG__FALLBACK_MODELS": "[]"})
+    env.update({"PYTHONPATH": str(OPT["code"]), "REVIEW_EVAL_COMMAND": OPT["command"], "CONFIG__MODEL": model,
+                "CONFIG__MODEL_WEAK": model, "CONFIG__MODEL_REASONING": model, "CONFIG__FALLBACK_MODELS": "[]"})
     env.update(overrides)
     provider = model.split("/", 1)[0] if "/" in model else "openai"
     keys = [k for k in SECRET_ENV.get(provider, ()) if os.environ.get(k)]
@@ -127,13 +133,22 @@ def review(case, rep, out, wt, env):
     if status.exists() and json.loads(status.read_text())["ok"]:
         return run
     run.mkdir(parents=True, exist_ok=True)
+    if OPT["combine"]:
+        srcs = [pathlib.Path(o) / "runs" / case["key"] / f"r{rep}" for o in OPT["combine"]]
+        sts = [json.loads((r / "status.json").read_text()) for r in srcs]
+        (run / "sources.json").write_text(json.dumps([str(r) for r in srcs]))
+        (run / "judged.json").unlink(missing_ok=True)
+        status.write_text(json.dumps({"ok": all(x["ok"] for x in sts), "error": None,
+                                      "usage": sum((x["usage"] for x in sts), []),
+                                      "finish": sum((x["finish"] for x in sts), [])}))
+        return run
     for stale in ("final.md", "review.json", "judged.json"):  # a rerun never keeps the failed attempt's output
         (run / stale).unlink(missing_ok=True)
     (run / "case.json").write_text(json.dumps({k: case[k] for k in ("title", "branch", "description", "tickets")}))
     env = {**env, "REVIEW_EVAL_RUN_DIR": str(run), "REVIEW_EVAL_CASE": str(run / "case.json"),
            "REVIEW_EVAL_TARGET_BRANCH": BRANCH_PREFIX + case["key"]}
     try:
-        p = subprocess.run([sys.executable, str(REPLAY)], cwd=wt, env=env, capture_output=True, text=True,
+        p = subprocess.run([OPT["python"], str(REPLAY)], cwd=wt, env=env, capture_output=True, text=True,
                            timeout=900)
         (run / "stderr.log").write_text(p.stderr[-20000:])
     except subprocess.TimeoutExpired:
@@ -151,17 +166,24 @@ def context(case, wt):
     return f"PR title: {case['title']}\n\nPR description:\n{case['description']}\n\nPR diff:\n{diff}"
 
 
+def extract(run):
+    if (run / "sources.json").exists():
+        return sum((extract(pathlib.Path(r)) for r in json.loads((run / "sources.json").read_text())), [])
+    if not json.loads((run / "status.json").read_text())["ok"]:
+        return []
+    if (run / "improve.json").exists():
+        return score.findings_from_improve(json.loads((run / "improve.json").read_text()), OPT["threshold"])
+    if (run / "review.json").exists():
+        return score.findings_from_review(json.loads((run / "review.json").read_text()))
+    return score.findings((run / "final.md").read_text(errors="replace"))
+
+
 def judge_run(case, run, wt, judge_model):
     """Cached judge verdicts for one run: catch verdicts by two judges, or a precision verdict per finding."""
     f = run / "judged.json"
     if f.exists() and not json.loads(f.read_text()).get("judge_error"):
         return json.loads(f.read_text())
-    status = json.loads((run / "status.json").read_text())
-    found = []
-    if status["ok"] and (run / "review.json").exists():
-        found = score.findings_from_review(json.loads((run / "review.json").read_text()))
-    elif status["ok"]:
-        found = score.findings((run / "final.md").read_text(errors="replace"))
+    found = extract(run)
     text = "\n\n".join(f"[{i}] {t}\n{b}" for i, (t, b) in enumerate(found))
     res = {"findings": len(found), "usage": []}
     if case["kind"] == "catch":
@@ -257,7 +279,15 @@ def main():
     ap.add_argument("--set", action="append", default=[], metavar="SECTION__KEY=VALUE",
                     help="pr-agent setting override for the reviewed runs, repeatable")
     ap.add_argument("--keep-worktrees", action="store_true")
+    ap.add_argument("--code", type=pathlib.Path, help="pr-agent tree to replay (default: this checkout)")
+    ap.add_argument("--python", help="interpreter for the replay (default: this one)")
+    ap.add_argument("--command", choices=("review", "improve"), default="review")
+    ap.add_argument("--threshold", type=int, default=1, help="/improve: lowest suggestion score that is posted")
+    ap.add_argument("--combine", nargs="+", default=[], help="judge these outs' findings together, no replays")
     args = ap.parse_args()
+    OPT.update({"code": (args.code or REPO).resolve(), "python": args.python or sys.executable,
+                "command": args.command, "threshold": args.threshold,
+                "combine": [str(pathlib.Path(o).resolve()) for o in args.combine]})
 
     cases = json.loads(args.cases.read_text())["cases"]
     if args.tier == "fast":

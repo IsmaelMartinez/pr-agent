@@ -8,8 +8,8 @@ import time
 
 import litellm
 
-KEY_ENV = {"openai": ("OPENAI__KEY", "OPENAI_KEY", "OPENAI_API_KEY")}
-API_BASE = {"openai": "https://api.openai.com/v1"}
+KEY_ENV = {"openai": ("OPENAI__KEY", "OPENAI_KEY", "OPENAI_API_KEY"), "anthropic": ("ANTHROPIC__KEY",)}
+API_BASE = {"openai": "https://api.openai.com/v1", "anthropic": None}  # spike: local runs only
 VERDICTS = {"caught", "partial", "missed"}
 CATCH_ATTEMPTS = 3
 MAX_LOOKUPS, READ_LINES, GREP_LINES, MAX_TEXT = 8, 120, 40, 200

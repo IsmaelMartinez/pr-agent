@@ -27,6 +27,26 @@ def findings_from_review(review):
     return out
 
 
+def findings_from_improve(data, threshold=1):
+    """[(title, body)] from /improve's code suggestions scored at or above threshold."""
+    out = []
+    for s in (data or {}).get("code_suggestions") or []:
+        if not isinstance(s, dict):
+            continue
+        try:
+            sc = int(s.get("score"))
+        except (TypeError, ValueError):
+            sc = None
+        if sc is None or sc < threshold:
+            continue
+        body = f"{str(s.get('relevant_file', '')).strip()} lines {s.get('relevant_lines_start')}-" \
+               f"{s.get('relevant_lines_end')}\n{str(s.get('suggestion_content', '')).strip()}"
+        if s.get("improved_code"):
+            body += f"\nSuggested fix:\n{s.get('existing_code') or ''}\n->\n{s['improved_code']}"
+        out.append((str(s.get("one_sentence_summary") or s.get("label") or "").strip(), body.strip()))
+    return out
+
+
 def findings(review_md):
     """[(title, body)] of the findings in a /review comment, in order (fallback when no review.json exists). Fix
     sub-headings and bold lines inside code fences stay in their finding."""
