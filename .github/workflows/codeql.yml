@@ -19,6 +19,7 @@ jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       security-events: write
       packages: read
@@ -31,14 +32,31 @@ jobs:
           - language: python
             build-mode: none
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # PR checkouts use merge commits; fetch both parents for HEAD^1/HEAD^2.
+          fetch-depth: 2
 
-      - uses: github/codeql-action/init@53e96ec3b35fce51c141c0d6f0e31028a448722d  # v3
+      # Keep the CodeQL check present on PRs, but avoid scanning unchanged Python.
+      - id: docs
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          if git rev-parse -q --verify 'HEAD^2' > /dev/null &&
+             git diff --no-renames --quiet HEAD^1 HEAD -- . \
+               ':(top,exclude,glob)docs/docs/**/*.md' \
+               ':(top,exclude,glob)docs/docs/**/*.mdx'; then
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        if: steps.docs.outputs.docs_only != 'true'
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-extended,security-and-quality
 
-      - uses: github/codeql-action/analyze@53e96ec3b35fce51c141c0d6f0e31028a448722d  # v3
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        if: steps.docs.outputs.docs_only != 'true'
         with:
           category: "/language:${{ matrix.language }}"
